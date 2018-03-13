@@ -1,0 +1,186 @@
+===== OPENSTACK ADMINISTRATOR STUFF =====
+
+==== Using the nova, glance etc clients ====
+
+To use nova and other client commands, have to provide authentication. Do this by logging into openstack as admin, going into the admin project, Access and Security, API access and downloading the openstack RC credentials (admin-openrc.sh file). This then needs to either be copied into the controller node, copying from the terminal to the MAAS node then logging onto the controller and copying the file from the MAAS node:
+<code>
+sudo scp admin-openrc.sh ubuntu@192.168.0.12:/home/ubuntu
+ssh ubuntu@192.168.0.12
+juju ssh 1
+scp 192.168.0.12:/home/ubuntu/admin-openrc.sh .
+</code>
+
+or locally if you have installed the nova, keystone and other required clients (in these cases use the --insecure option in the nova client calls).
+
+Then from the controller node do: 
+<code>
+source admin-openrc.sh 
+</code>
+then can do stuff like reset the state of an instance to 'active' (from error, so that allows you to reboot from the GUI) 
+
+<code bash>
+$ nova show 4154f504-d8e9-4322-9ef9-4fe723a93d2f                    # shows info and the status (and error from log if in error state)
+$ nova reset-state --active 4154f504-d8e9-4322-9ef9-4fe723a93d2f    # reset the state to active from error, to allow reboot
+$ nova reboot 4154f504-d8e9-4322-9ef9-4fe723a93d2f                  # reboot the instance
+
+$ nova host-list                         # list all hosts
+$ nova list --all-tenants                # list all instances across all tenants
+$ nova list --host nova2 --all-tenants   #list the tenants on a specified host
+</code>
+
+
+
+==== Getting images into openstack ====
+<note tip>The dashboard isnt very good at doing this.</note> 
+On the controller, having got the authentication set up for clients, mount the NAS where VM images are stored (which can also be used for backing up snapshot images later) do the following:
+
+== Ubuntu 12.04 image ==
+Best bet is to download the image directly from the NAS. Note that this image wont boot onto a 1GB disk, so need to modify the 'tiny' flavour in openstack to 2GB. the default password for the ubuntu image is 'ubuntu'.
+<code>
+source admin-openrc.sh
+glance image-create --name='Ubuntu 12.04LTS' --is-public=true --container-format=bare --disk-format=qcow2 < /nas/vmimages/precise-server-cloudimg-amd64-disk11.img
+</code>
+== Cirros test image ==
+In a CirrOS image, the login account is cirros. The password is cubswin:)
+<code>
+wget http://download.cirros-cloud.net/0.3.2/cirros-0.3.2-x86_64-disk.img
+glance image-create --name='Cirros image' --is-public=true --container-format=bare --disk-format=qcow2 < cirros-0.3.1-x86_64-disk.img
+</code>
+== Windows 2012 Server ==
+A trial version of this can be downloaded from the web (http://www.cloudbase.it/ws2012r2/) onto the NAS - its quite big (16GB) when unzipped. I specified a minimum disk size of 40GB.
+<code>
+glance image-create --name='Windows 2012 server' --is-public=true --min-disk=40 --container-format=bare --disk-format=qcow2 < /nas/vmimages/Windows\ server\ 2012/windows-server-2012-r2.qcow2
+</code>
+
+==== Problems with rebooting instances ====
+
+If someone tries to boot or reboot an instance and it doesnt work things to check are:
+
+a) permissions on the shared NAS storage.
+Check this by going into the controller or wherever you can use the nova client and doing
+  nova show <instance_id>
+This will show useful messages, especially if the var/lib/nova/instances/ folder doesnt have the right permissions.
+In that case, logon to the instance host machine, and do an ls -an for that instance folder to see the permissions.
+
+If the owners arent right, do sudo chown nova:nova <file> to take ownership. Should be:
+  * nova:nova for disk.info and libvirt.xml and 
+  * libvirt-qemu:kvm for disk and console.log
+If they arent right, use sudo chmod 644 * to update all the permissions to read and write. This 'should' work....try resetting the status and rebooting the instance using the nova client. 
+
+b) Locks
+Previously I have also found....if you log into the synology NAS, go into the COMPUTESTORAGE/locks folder and delete all the lock files, users can then shutoff their instance (if it is in an error state) and then start it agian and it will come up and be able to reboot. Obviously this runs the risk of other users locking the base image files if they are doing stuff at the same time. 
+
+==== Problems with VM connections or networking ====
+See this sometimes in the instance log where is says 'no instance-local data' after it has run the cloud config bit.
+
+Need to check all juju services are running OK (do a juju status).
+Then try rebooting neutron node.
+Then try rebooting controller node (as this runs the metadata service amd sometimes in the neutron node you see log errors like 'cant contact metadata server'.
+
+
+==== Problems with attaching volumes ====
+
+If cant attach volumes (essentially it says it is but doesnt, I have found an error in the cinder logs saying "OS error cant allocate memory". This means the VM has run out of RAM to carry out that command - can confirm this in the VM by doing "free -m". Simply reboot the cinder VM.
+
+==== Problems with migrating/resizing instances ====
+
+If cant live migrate or resize, check all mounts are OK. Then check that each compute node can ssh into each other (use sudo -u nova ssh 192.168.0.X). If not copy id keys from the id_rsa.pub file in /var/lib/nova/.ssh directory into the authorised keys file on the other comptue nodes. Also check that NOVA is the owner of the known_hosts file as otherwise it wont get updated when you ssh in.
+
+==== Openstack Maintenance ====
+
+To remove a compute node for maintenance, make sure there are no instances running on it (or if there are, shut them down (i.e. stop) them which saves them to disk). SSH into the node and do:
+<code>
+sudo stop nova-compute
+</code>
+This will stop the service, you can then switch the machine off and do whatever. When reconnected, boot it up and all should be fine. SSH into it and do:
+<code>
+sudo start nova-compute
+</code>
+Further instructions are here-> http://docs.openstack.org/trunk/openstack-ops/content/maintenance.html
+
+==== Maintenance: MAAS and JUJU ====
+
+When rebooting MAAS server, check that the MAAS DNS service is running properly. If not, add the MAAS server IP address to /etc/bind/named.conf under the dns-nameservers option.
+
+If rebooting stuff, MAAS and JUJU can get a little out of touch. This sometimes results in services not coming back up nicely. If you cant resolve them, then you might have to forcibly remove the service and machine from JUJU and MAAS and essentially start again. Use:
+<code>
+juju remove-machine --force X
+</code>
+To **forcibly remove a machine** and everything on it, and wipe clear the JUJU database of active machines. This is needed sometimes as it retains the IP or node ID and then gets confused when trying to reuse that IP address if its the same machine (and so never picks it as it believes its in use). This should return it to MAAS control properly (ie it will be ready in the console).
+
+**Targeted deployment** adding the machine first then the service to the machine:
+<code>
+juju add-machine --constraints tags=ceph
+juju add-unit --to 40 ceph
+</code>
+
+**Naming services** is available by adding an alias after the charm name in deployment. Remember that if you are using an external config file (ie ons-openstack.yaml) you will need to change it to refer to the alias in there:
+<code>
+juju deploy -n 3 local:ceph cephstore --repository=/home/ubuntu/charms --config ~/ons-openstack.yaml --constraints tags=ceph
+</code>
+
+**MAAS server running out of space**
+The MAAS server stores local copies of images for use in deploying machines. It stores them in /var/lib/maas/boot-resources. Check if the disk is full by doing df -h. Solution is to mount a directory on the NAS and redirect MAAS to store boot images there. Create a folder on the NAS called MAAS/boot-resources.
+First create the directory and do the mount
+<code>
+sudo mkdir /mnt/MAAS
+sudo echo "192.168.0.9:/volume1/MAAS /mnt/MAAS  nfs defaults 0 0" >> /etc/fstab
+mount -a
+</code>
+
+Then create a symbolic link for the boot-resources folder back to the NAS folder we have just mounted
+<code>
+sudo ln -s /mnt/MAAS/boot-resources /var/lib/MAAS/boot-resources
+</code>
+NEED TO CHECK THAT THIS IS RIGHT
+
+
+==== Image Backups ====
+To take a copy of images or snapshots from openstack follow the instructions here from the controller node or anywhere where you have the glance client installed (assuming you have got admin source files sorted as described [[administrator_stuff#Using the nova,glance etc clients|here]]):
+http://docs.openstack.org/user-guide/content/cli_migrate_instances.html
+
+This works excellently for creating backups of servers you have customised.
+Assuming you have mounted the NAS virtual images directory you can make a copy directly using:
+<code> nova --insecure image-list
+glance image-download --file /nas/vmimages/imagebackups/testing2.raw 595bbdef-65e2-4c50-912c-7ac3494bf1b7
+</code>
+
+
+==== Bash history file backups ====
+Here is a script for backing up bash history files from juju controlled machines
+<code bash backup_hist.sh>
+#!/bin/sh
+####################################
+#
+# Backup bash histories to local machine.
+# Have to specify machine numbers.
+####################################
+
+#for i in {0..6} 10 11 12 17 37 45 46 47
+for i in quantum-gateway/0 keystone/0 rabbitmq-server/0 mysql/0 glance/0 cinder/0 ceph-radosgw/0 nova-cloud-controller/0 nova-compute/13
+
+do
+
+echo "Backing up history for machine $i"
+
+j=$(echo $i | sed 's!/!!')
+
+juju scp $i:~/.bash_history /home/ubuntu/backup/history-$j
+
+done
+</code>
+
+==== Swapping out Ceph Disks ====
+
+<note warning>In progress by Owen</note>
+This page explains how to add and remove OSDs (ie HDDs) to a cluster. 
+https://ceph.com/docs/master/rados/operations/add-or-rm-osds/
+Replacing:
+Log into the ceph node that has the OSD you want to replace and follow the instructions
+sudo ceph osd tree shows the OSD layout and numbers.
+
+==== Dealing with a broken ceph cluster ====
+
+If one of the ceph cluster nodes goes down (ie the machine is down in juju status), then ssh into one of the remaining machines and see what sudo ceph health details says. Also sudo ceph -s will give some information.
+
+If its the monitor that is down, and juju shows the machine itself down, try rebooting the machine (physically turn off and on). If necessary, connect a monitor/keyboard to see whether it is booting from maas correctly. It shouldnt take long to boot up. If it doesnt work, try a couple of times (I took 3 attempts before the machine rebooted). It should then come back, and the cluster will then repair itself (you can see progress by running sudo ceph health).
