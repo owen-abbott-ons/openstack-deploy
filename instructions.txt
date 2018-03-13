@@ -1,0 +1,634 @@
+===== OPENSTACK DEPLOYMENT - 14.04 ICEHOUSE RELEASE =====
+
+This outlines the steps taken to build the Titchfield Lab.
+
+====Outline Design==== 
+  * Ubuntu 14.04 LTS to be the underlying OS
+  * Stable version of MAAS, JUJU and Icehouse release of openstack compnents
+  * Single hypervisor host running VMs which run MAAS/Juju/openstack services. Also runs LDAP server.
+  * Main hypervisor to have 2x2TB HDDs which are mirrored (RAID1?).
+  * 3 Ceph Servers, each with 4 2TB HDDs.
+  * 5 Compute nodes
+  * Compute storage on the NAS (through NFS mounts)
+  * NTP service on all nodes
+
+====Networking====
+  * All user facing terminals to be connected to switch 1
+  * Printer to connect to switch 1
+  * Two Bonded NAS ports to connect to switch 1
+  * Two port bond between switch 1 and switch 2
+  * All openstack servers connected to switch 2
+  * Single NAS port connected to Switch 2
+  * Internet connection to Switch 1 (to be expanded to switch 2 later)
+  * Main hypervisor to have two bonded NICs to provide better networking capacity
+
+
+====Main steps====
+(assuming Hypervisor is currently running 12.04:
+
+  * Upgrade controller to 14.04
+  * Bond its network ports
+  * Get the Preseed file needed for MAAS VM
+  * Create MAAS VM and setup MAAS
+  * Create necessary VMs, commission them
+  * PXE boot remaining physical servers and tag
+  * Install JUJU.
+  * Get the required charm config file ready
+  * Deploy JUJU charms to VMs and machines
+  * Add NTP subordinate charm
+  * Get openstack working
+  * Test
+  * Upload backed up glance images
+  * Test they work
+
+Found 14.04LTS openstack installation instructions here:
+https://insights.ubuntu.com/2014/05/21/ubuntu-cloud-documentation-14-04lts/
+
+----
+==== Hypervisor Upgrade and Port bonding ====
+
+Upgrade the hypervisor to 14.04. The Hypervisor IP address is 192.168.0.11 and uses the usual lab username and password.
+<code>
+sudo do-release-upgrade
+</code>
+
+With two Ethernet ports connected to the same switch, we can bond the ports together to provide either/or/and greater bandwith and a failsafe. We will need to have a bond AND a bridge (as the VMs connect to the bridge). The Ubuntu guide is here: https://help.ubuntu.com/community/UbuntuBonding
+
+So do this:
+<code>
+sudo apt-get install ifenslave
+
+sudo vi /etc/modules
+<code>
+
+Make sure it has these in it
+<code>
+# /etc/modules: kernel modules to load at boot time.
+#
+# This file contains the names of kernel modules that should be loaded
+# at boot time, one per line. Lines beginning with “#” are ignored.
+loop
+lp
+rtc
+bonding
+</code>
+
+Stop netowrking then load the bonding kernel module.
+<code>
+sudo stop networking
+sudo modprobe bonding
+</code>
+
+Edit the Interfaces file
+<code>
+sudo vi /etc/network/interfaces
+</code>
+
+The original file should look like this:
+<code>
+Bridged (original)
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+# The primary network interface
+auto br0
+iface br0 inet static
+        address 192.168.0.11
+        gateway 192.168.0.1
+        network 192.168.0.0
+        netmask 255.255.255.0
+        broadcast 192.168.0.255
+        dns-nameservers 194.72.0.98 194.74.65.68
+        bridge_ports eth0
+        bridge_stp off
+        bridge_maxwait 0
+</code>
+
+Modify it to look like the below, which implements a bond a nd a bridge using the tlb load balancing option which essentially uses up eth0 first then uses eth1 if traffic is too much, and also has a failsafe if one fails:
+<code>
+Bridged and bonded
+
+auto bond0
+iface bond0 inet manual
+        bond-mode balance-tlb
+        bond-miimon 100
+        bond-lacp-rate 1
+        bond-slaves none
+
+auto eth0
+iface eth0 inet manual
+        bond-master bond0
+        bond-primary eth0
+
+auto eth1
+iface eth1 inet manual
+        bond-master bond0
+
+auto br0
+iface br0 inet static
+        address 192.168.0.11
+        gateway 192.168.0.1
+        network 192.168.0.0
+        netmask 255.255.255.0
+        broadcast 192.168.0.255
+        dns-nameservers 194.72.0.98 194.74.65.68
+        bridge_ports bond0
+        bridge_fd 0
+        bridge_hello 2
+        bridge_maxage 12
+        bridge_stp off
+        bridge_maxwait 0
+</code>
+
+Bring up the network again, and begin to check that everything is OK:
+<code>
+sudo start networking
+
+ifconfig
+
+ip a
+
+cat /proc/net/bonding/bond0
+</code>
+
+ifup bond0 and ifdown bond0 are used to bring up or down the bond.
+
+----
+==== MAAS VM setup and installation ====
+
+Setup the MAAS VM. We will use 192.168.0.12 as its IP address.
+You will need the preseed.cfg file at the end of this document.
+<code>
+# This creates the space on the HDD that is allocated to the VM
+sudo lvcreate system-hdd -n maas -L 20GB
+
+# Create the VM using the preseed.cfg file and the 14.04 image from the web
+sudo virt-install --name=maas --ram=8096 --vcpus=2 --disk path=/dev/mapper/system--hdd-maas,bus=virtio,cache=writeback --initrd-inject=/home/methodsadmin/preseed.cfg --network bridge=br0,model=virtio --noautoconsole --graphics vnc --location=http://gb.archive.ubuntu.com/ubuntu/dists/trusty/main/installer-amd64/ -x "file=/preseed.cfg netcfg/choose_interface=eth0 netcfg/disable_autoconfig=true netcfg/get_nameservers=8.8.8.8 netcfg/get_ipaddress=192.168.0.12 netcfg/get_netmask=255.255.255.0 netcfg/get_gateway=192.168.0.1 netcfg/confirm_static=true locale=en_GB priority=critical hostname=maas"
+</code>
+
+The MAAS VM should be up and running now. SSH into it using ssh ubuntu@192.168.0.12.
+Now we need to update the VM, install MAAS, create a superuser, generate a keypair and use it in MAAS. Lastly we install libvirt-bin which will allow MAAS to power on the other VMs we will setup. 
+<code>
+sudo apt-get update
+sudo apt-get upgrade
+
+sudo apt-get install maas maas-dhcp maas-dns software-properties-common
+# Creating a superuser - I used the default username and password we use for admins in the labs
+sudo maas-region-admin createsuperuser
+ssh-keygen -f maas
+sudo mkdir -pv ~maas/.ssh/
+sudo mv maas.pub ~maas/.ssh/id_rsa.pub
+sudo chown -Rv maas:maas ~maas
+
+sudo apt-get -y install libvirt-bin
+</code>
+
+You should now be able to log into MAAS (at 192.168.0.12/MAAS) using the superuser credentials. You should then:
+  * Define and set up the cluster controller, making it manage DHCP and DNS and defining the ranges it will manage - here we manage IP range 192.168.0.14 to 192.168.0.49 which will be enough to cover the virtual and physical machines for runningopenstack services (The 50-200 addresses will then be used for floating IPs to attach to openstack instances)
+  * Add the ssh key you generated above
+  * Start MAAS importing boot images (which can take a while)
+You can follow what to do here -> https://insights.ubuntu.com/2014/05/21/ubuntu-cloud-documentation-14-04lts/
+
+----
+====Set up additional VMs for openstack services====
+
+We will now set up and PXE boot the remaining required VMs. These will boot and register themselves with MAAS.
+
+<code>
+# Set up the remaining required VMs note these are set to PXE boot as we will use MAAS to install the OS
+
+sudo lvcreate system-hdd -n glance -L 20GB;
+sudo lvcreate system-hdd -n dashboard -L 20GB;
+sudo lvcreate system-hdd -n cinder -L 10GB;
+sudo lvcreate system-hdd -n keystone -L 10GB;
+sudo lvcreate system-hdd -n rabbitmq -L 10GB;
+sudo lvcreate system-hdd -n cephradosgw -L 10GB;
+sudo lvcreate system-hdd -n controller -L 20GB;
+sudo lvcreate system-hdd -n mysql -L 20GB;
+sudo lvcreate system-hdd -n bootstrap -L 20GB
+sudo lvcreate system-hdd -n neutron -L 20GB
+
+
+sudo virt-install --name=bootstrap --ram=6144 --vcpus=2 --disk path=/dev/mapper/system--hdd-bootstrap,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=glance --ram=6144 --vcpus=2 --disk path=/dev/mapper/system--hdd-glance,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=cinder --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-cinder,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=controller --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-controller,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=dashboard --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-dashboard,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=mysql --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-mysql,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=keystone --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-keystone,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=rabbitmq --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-rabbitmq,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=cephradosgw --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-cephradosgw,bus=virtio,cache=writeback --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+
+sudo virt-install --name=neutron --ram=8192 --vcpus=2 --disk path=/dev/mapper/system--hdd-neutron,bus=virtio,cache=writeback --network bridge=br0,model=virtio --network bridge=br0,model=virtio --noautoconsole --vnc --pxe
+</code>
+
+When they have registered themselves, go back into MAAS and rename them - I have used virt-'service' to indicate they are virtual and the service they will host. You will need to add power parameters so that MAAS can turn them on and off. If you want the openstack dashboard to goto a particular IP address, you will need to figure out the order in which to boot them.
+
+Use Virsh and power parameters for VMs:
+<code>
+  * qemu+ssh://methodsadmin@192.168.0.11/system
+  * VM Name
+</code>
+The IP address is that of the hypervisor.
+
+Also need to PXE boot the physical machines that MAAS will manage. Set to PXE boot through the BIOS (F2 for old machines, F12 for the newer ones).
+
+Need to commission all the declared nodes. This is fine - but be wary of using the fast installer. Its quicker, but can be inconsistent (or fail) when using multiple NICs or HDDs/SSDs (important for Ceph nodes and quantum nodes, and potentially if we want to use multiple NICs for other services later). For NICs it can result in eth0 and eth1 being mixed up, and the same for HDDs (ie the SDD can come up as sde). It can also result in different IDs (eg for Nova) between fast and default. I suggest in general use the default installer unless you know you can use the fast installer across the whole set of service.
+
+----
+====MAAS Tagging====
+
+Before we deploy the JUJU charms we need to tag the machines we want to use to host these services. This allows us to control what gets deployed where (wouldnt need to do this if all machines were identical).
+
+Login to the MAAS CLI (Get the id from the maas user preferences):
+<code>
+maas login methodsadmin http://192.168.0.12/MAAS/api/1.0 mBJxCbYeRUEc4GVCFe:zbmUXVpmS9PBtNFFw2:XUs9pXM53mxqWq9ttPKQXkdLfeJVb9Jb
+</code>
+
+Setup the tags we will use
+<code>
+maas methodsadmin tags new name='rabbitmq' comment="RabbitMQ machines";
+maas methodsadmin tags new name='ceph' comment="Ceph machines";
+maas methodsadmin tags new name='controller' comment="Cloud Controller machines";
+maas methodsadmin tags new name='glance' comment="Glance machines";
+maas methodsadmin tags new name='mysql' comment="Mysql machines";
+maas methodsadmin tags new name='cephradosgw' comment="Ceph RADOS machines";
+maas methodsadmin tags new name='keystone' comment="Keystone machines";
+maas methodsadmin tags new name='dashboard' comment="Dashboard machines";
+maas methodsadmin tags new name='bootstrap' comment="Juju bootstrap machines";
+maas methodsadmin tags new name='cinder' comment="Cinder machines";
+maas methodsadmin tags new name='neutron' comment="Neutron machines";
+maas methodsadmin tags new name='compute' comment="Nova compute machines";
+</code>
+
+List all the nodes:
+<code>
+maas methodsadmin nodes list
+</code>
+Tag them (need to get the system_id from the node list), can add more than one per tag or remove at the same time:
+<code>
+maas methodsadmin tag update-nodes compute add=node-285831e2-89c9-11e4-9c28-5254000db819
+</code>
+
+----
+==== Install and setup JUJU ====
+
+We we use the stable version of JUJU and get the charm tools at the same time.
+<code>
+sudo add-apt-repository ppa:juju/stable
+sudo apt-get update
+sudo apt-get upgrade
+
+sudo apt-get install juju-core charm-tools
+
+juju generate-config
+</code>
+
+Need to edit the ~/.juju/environments.yaml config file to use MAAS as the default and define the MAAS environment, like this:
+<code>
+ maas:
+        type: maas
+    
+        # maas-server specifies the location of the MAAS server. It must
+        # specify the base path.
+        #
+        maas-server: 'http://192.168.0.12/MAAS/'
+    
+        # maas-oauth holds the OAuth credentials from MAAS.
+        #
+        maas-oauth: 'mBJxCbYeRUEc4GVCFe:zbmUXVpmS9PBtNFFw2:XUs9pXM53mxqWq9ttPKQXkdLfeJVb9Jb'
+        default-series: trusty    
+        # maas-server bootstrap ssh connection options
+        #
+        authorized-keys-path: ~/.ssh/authorized_keys 
+        # bootstrap-timeout time to wait contacting a state server, in seconds.
+        bootstrap-timeout: 2500
+</code>
+
+Now get the required juju tools and bootstrap (using the tagged bootstrap node), then check to see if its running.
+
+<code>
+juju switch maas
+juju sync-tools --debug
+juju bootstrap --constraints tags=bootstrap --upload-tools --debug
+
+juju status
+</code>
+
+==== Get and modify JUJU openstack charms ====
+
+Get JUJU charms and store them locally
+<code>
+mkdir ~/charms;
+cd ~/charms;
+export JUJU_REPOSITORY=~/charms;
+
+juju set-env "default-series=trusty";
+
+juju charm get keystone;
+juju charm get mysql;
+juju charm get glance;
+juju charm get ceph;
+juju charm get ceph-radosgw;
+juju charm get rabbitmq-server;
+juju charm get nova-compute;
+juju charm get nova-cloud-controller;
+juju charm get neutron-gateway;
+juju charm get openstack-dashboard;
+juju charm get cinder;
+juju charm get ntp;
+</code>
+
+Now Edit the compute charm to add the mounting of the NAS as instance storage. We are using NFSv4 for this, so we require the LDAP stuff to be configured and the NAS using the right settings as per the [[openstack_deployment|havana documentation.]]
+<code>
+cd ~/charms/trusty/nova-compute/
+mkdir -pv exec.d/mountnfs/
+vi exec.d/mountnfs/charm-pre-install
+</code>
+
+add:
+<code>
+#!/bin/sh -e
+
+apt-get install -y nfs-common
+mkdir -pv /var/lib/nova/instances/
+mount -t nfs 192.168.0.9:/volume1/INSTANCESTORAGE /var/lib/nova/instances/
+
+echo "192.168.0.9:/volume1/INSTANCESTORAGE /var/lib/nova/instances/ nfs defaults 0 0" | tee -a /etc/fstab
+
+exit 0
+</code>
+
+Modify the permissions to allow it to be executed
+<code>
+chmod 0755 exec.d/mountnfs/charm-pre-install
+</code>
+----
+==== Deploy JUJU openstack charms ====
+
+Edit/get the juju charms deployment config file - ons-openstack-icehouse.yaml at the end of the document.
+If starting afresh, need a ceph key for this, so do:
+<code>
+sudo apt-get install ceph-common
+ceph-authtool /dev/stdout --name=mon. --gen-key
+</code>
+
+Now deploy all the charms we have downloaded, using the config file and using the machines we have tagged. Do the controller first so that is machine 1 (easy to remember to ssh into). You can monitor progess by looking at juju debug-log.
+<code>
+cd ~
+
+juju set-constraints tags=
+
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=controller local:nova-cloud-controller
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=keystone local:keystone
+juju deploy --constraints tags=glance local:glance
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=neutron local:neutron-gateway
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=dashboard local:openstack-dashboard
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=cinder local:cinder
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=ceph local:ceph -n 3
+juju deploy --constraints tags=cephradosgw local:ceph-radosgw
+juju deploy --constraints tags=rabbitmq local:rabbitmq-server
+juju deploy --config ~/ons-openstack-icehouse.yaml --constraints tags=mysql local:mysql
+juju deploy --config ~/ons-openstack-icehouse.yaml local:nova-compute -n 5
+</code>
+
+If you need to configure the ceph osds based on how the nodes are configured becuse you didnt know and you didnt include that config in the config file (or commented it out) ssh into them to find out:
+<code>
+juju set ceph osd-reformat: 'true'
+juju set ceph osd-devices: /dev/sdb /dev/sdc /dev/sdd /dev/sde
+</code>
+
+Before you start adding relations between things, check all services are up and started. In particular, check that Ceph is running properly and is healthy. SSH into one of the machines and look:
+
+<code>
+sudo ceph -s
+</code>
+
+If it doesnt say its healthy, or there are not all of the osds (ie HDDs) you expected, need to sort that out first. I have had to tell ceph how many placement groups to use before as it said there werent enough so i used the following to set (apparently according to http://ceph.com/docs/master/rados/operations/placement-groups/ should be OSD*100/pool size):
+<code>
+sudo ceph osd pool set rbd pg_num 128
+sudo ceph osd pool set rbd pgp_num 128
+</code>
+
+If everything is working, start adding relations. Its suggested that you dont do this too quickly, especially those involving mysql and keystone links as these sort out permissions. You can monitor progess by looking at juju debug-log.
+<code>
+juju add-relation keystone mysql
+juju add-relation nova-cloud-controller mysql
+juju add-relation nova-cloud-controller rabbitmq-server
+juju add-relation nova-cloud-controller glance
+juju add-relation nova-cloud-controller keystone
+juju add-relation nova-compute mysql
+juju add-relation nova-compute:amqp rabbitmq-server:amqp
+juju add-relation nova-compute glance
+juju add-relation nova-compute nova-cloud-controller
+juju add-relation nova-compute ceph
+juju add-relation glance mysql
+juju add-relation glance keystone
+juju add-relation openstack-dashboard keystone
+juju add-relation cinder keystone
+juju add-relation cinder mysql
+juju add-relation cinder rabbitmq-server
+juju add-relation cinder nova-cloud-controller
+juju add-relation neutron-gateway mysql
+juju add-relation neutron-gateway nova-cloud-controller
+juju add-relation neutron-gateway:amqp rabbitmq-server:amqp
+juju add-relation cinder ceph
+juju add-relation glance ceph
+juju add-relation ceph-radosgw ceph
+juju add-relation ceph-radosgw keystone
+</code>
+
+Now add admin user to ceph-radosgw by doing:
+
+juju ssh ceph/0 \ 'sudo radosgw-admin user create --uid="ubuntu" --display-name="Ubuntu Ceph"'
+
+In theory, everything should be related and working. Check with juju status.
+Can also check by getting the admin credentials (this http://insights.ubuntu.com/wp-content/uploads/UCD-latest.pdf?utm_source=Ubuntu%20Cloud%20documentation%20%E2%80%93%2014.04%20LTS&utm_medium=download+link&utm_content= tells you how to get them if you cant get into the dashboard) onto the controller node and doing:
+<code>
+nova service-list
+cinder service-list
+keystone service-list
+nova availability-zone-list
+</code>
+----
+==== Add NTP service ====
+
+NTP is Network Time protocol - it keeps the server clocks in check.
+The NTP charm doesnt require a separate machine, it adds itself to existing services.
+so do:
+
+<code>
+juju deploy ntp
+juju add-relation ntp ceph;
+juju add-relation ntp ceph-radosgw;
+juju add-relation ntp nova-cloud-controller;
+juju add-relation ntp neutron-gateway;
+juju add-relation ntp nova-compute;
+juju add-relation ntp cinder;
+juju add-relation ntp glance;
+juju add-relation ntp keystone;
+juju add-relation ntp rabbitmq-server;
+juju add-relation ntp mysql;
+juju add-relation ntp openstack-dashboard
+
+juju set ntp peers="nilceph1.nil1.ons.gov.uk nilceph2.nil1.ons.gov.uk nilceph3.nil1.ons.gov.uk"
+</code>
+
+----
+==== Set up openstack services ====
+
+Now can try to log into the dashboard, check you can access all panels.
+Then download the openstack admin access credentials, and scp them into the controller node.
+
+Log into the controller node, source the admin credentials.
+
+Install nfs-common and mount the image storage location on the NAS, then upload an image.
+<code>
+sudo apt-get install nfs-common
+sudo mkdir -pv /nas/vmimages
+sudo mount -t nfs 192.168.0.9:/volume1/VMIMAGES /nas/vmimages
+cd /nas/vmimages/Ubuntu\ 14.04\ LTS\ 64/
+glance image-create --name='Ubuntu 14.04' --is-public=true --container-format=bare --disk-format=qcow2 < trusty-server-cloudimg-amd64-disk1.img
+</code>
+
+Now create the public network, and add default ssh and ping rules to the default set
+<code>
+neutron net-create Public-Network --router:external=True
+neutron subnet-create Public-Network --name Public-Subnet --allocation-pool start=192.168.0.51,end=192.168.0.200 --disable-dhcp --gateway 192.168.0.1 192.168.0.0/24
+
+nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0
+nova secgroup-add-rule default tcp 22 22 0.0.0.0/0
+</code>
+
+Now create a [project and user, and check everything works by adding a network, launching an instance and pinging and sshing into it. If this works, job done. If not, debug!
+
+If you are uploading snapshot images and want to make them available to specific projects do this:
+<code>
+keystone tenant-list
+glance image-list
+glance member-create <imageid> <tenantid>
+</code>
+
+----
+==== Preseed.cfg ====
+<code Preseed.cfg>
+# Ubuntu Server Preseed configuration.
+d-i debian-installer/locale string en_GB.UTF-8
+d-i debian-installer/splash boolean false
+d-i console-setup/ask_detect boolean false
+d-i console-setup/layoutcode string us
+d-i console-setup/variantcode string
+d-i time/zone string Etc/UTC
+d-i netcfg/choose_interface select eth0
+d-i netcfg/confirm_static boolean true
+d-i clock-setup/utc boolean true
+d-i partman-auto/method string regular
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman/confirm_write_new_label boolean true
+d-i partman/choose_partition select Finish partitioning and write changes to disk
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i partman/default_filesystem string ext4
+d-i clock-setup/utc boolean true
+d-i clock-setup/ntp boolean true
+d-i clock-setup/ntp-server string ntp.ubuntu.com
+d-i base-installer/kernel/image string linux-generic
+d-i base-installer/install-recommends boolean false
+d-i passwd/root-login boolean false
+d-i passwd/make-user boolean true
+d-i passwd/user-fullname string ubuntu
+d-i passwd/username string ubuntu
+d-i passwd/user-password-crypted password $6$.1eHH0iY$ArGzKX2YeQ3G6U.mlOO3A.NaL22Ewgz8Fi4qqz.Ns7EMKjEJRIW2Pm/TikDptZpuu7I92frytmk5YeL.9fRY4.
+d-i passwd/user-uid string
+d-i user-setup/allow-password-weak boolean false
+d-i user-setup/encrypt-home boolean false
+d-i passwd/user-default-groups string adm cdrom dialout lpadmin plugdev sambashare
+d-i mirror/http/mirror select gb.archive.ubuntu.com
+d-i mirror/country string manual
+d-i mirror/http/hostname string gb.archive.ubuntu.com
+d-i mirror/http/directory string /ubuntu/
+d-i apt-setup/mirror/error select Change mirror
+d-i apt-setup/multiverse boolean true
+d-i apt-setup/restricted boolean true
+d-i apt-setup/universe boolean true
+d-i archive-copier/desktop-task string
+d-i archive-copier/ship-task string
+d-i debian-installer/allow_unauthenticated string false
+d-i pkgsel/upgrade select safe-upgrade
+d-i pkgsel/language-packs multiselect
+d-i pkgsel/update-policy select none
+d-i pkgsel/updatedb boolean true
+d-i grub-installer/skip boolean false
+d-i lilo-installer/skip boolean false
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/with_other_os boolean true
+d-i finish-install/keep-consoles boolean false
+d-i finish-install/reboot_in_progress note
+d-i cdrom-detect/eject boolean true
+d-i debian-installer/exit/halt boolean false
+d-i debian-installer/exit/poweroff boolean false
+d-i pkgsel/include string vim openssh-server ntp language-pack-en byobu
+byobu/launch-by-default boolean false
+
+# Any hostname and domain names assigned from dhcp take precedence over
+# values set here. However, setting the values still prevents the questions
+# from being shown, even if values come from dhcp.
+d-i netcfg/get_domain string til1.ons.gov.uk
+d-i netcfg/get_hostname seen true
+d-i netcfg/get_domain seen true
+</code>
+
+==== ons-openstack-icehouse.yaml ====
+Note that we arent using https endpoints as they dont work in icehouse (yet).
+<code ons-openstack-icehouse.yaml>
+keystone:
+  admin-password: putyourpasswordhere
+  # debug: 'true'
+  # log-level: DEBUG
+  # https-service-endpoints: 'true'
+  enable-pki: 'True'
+nova-cloud-controller:
+  network-manager: 'Neutron'
+  quantum-security-groups: 'yes'
+  neutron-external-network: Public_Network
+nova-compute:
+  enable-live-migration: 'true'
+  enable-resize: 'true'
+  migration-auth-type: 'ssh'
+  virt-type: 'kvm'
+  config-flags: auto_assign_floating_ips=True,compute_driver=libvirt.LibVirtDriver
+quantum-gateway:
+  ext-port: 'eth1'
+  instance-mtu: 1400
+cinder:
+  block-device: None
+  overwrite: 'true'
+  glance-api-version: 2
+ceph:
+  fsid: 'f1fd4c7a-89cf-11e4-93c9-5254000db819'
+  monitor-secret: 'AQDYA5hUuA7qDRAAYwuBwLe7NklidnuxU1CaXQ=='
+  osd-devices: /dev/sdb /dev/sdc /dev/sdd /dev/sde
+  osd-reformat: 'true'
+openstack-dashboard:
+  debug: 'yes'
+mysql:
+  block-size: 10
+  max-connections: 500
+</code>
+
+
+
+
